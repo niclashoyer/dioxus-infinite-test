@@ -48,7 +48,7 @@ fn new_message() -> (Uuid, String) {
     (id, msg)
 }
 
-async fn scroll_to(id: &Uuid, pos: usize) {
+async fn scroll_to(id: &Uuid, pos: f32) {
     let _ = dioxus::document::eval(&format!(
         r#"
         let el = document.getElementById("{id}");
@@ -87,10 +87,21 @@ async fn scroll_min(id: &Uuid, min: f32) -> f32 {
     eval.recv().await.unwrap()
 }
 
+async fn scroll_height(id: &Uuid) -> f32 {
+    let mut eval = dioxus::document::eval(&format!(
+        r#"
+        let el = document.getElementById("{id}");
+        dioxus.send(el.scrollHeight);
+    "#
+    ));
+    eval.recv().await.unwrap()
+}
+
 #[component]
 fn Infinite() -> Element {
     let mut el = use_signal(|| None);
     let mut pos = use_signal(|| 0.0);
+    let mut scroll_height_before = use_signal(|| 0.0);
     let mut msgs: Signal<Vec<(Uuid, String)>> = use_signal(|| vec![]);
     let id = use_hook(|| Uuid::new_v4());
     use_hook(move || {
@@ -99,8 +110,16 @@ fn Infinite() -> Element {
         }
     });
     use_effect(move || {
+        let scroll_height_before = scroll_height_before();
         spawn(async move {
-            // scroll_to(&id, 1).await;
+            let pos = *pos.peek();
+            let scroll_height_now = scroll_height(&id).await;
+            let new_pos = pos + (scroll_height_now - scroll_height_before);
+            debug!("pos: {}", pos);
+            debug!("scroll height before: {}", scroll_height_before);
+            debug!("scroll height now: {}", scroll_height_now);
+            debug!("new_pos: {}", new_pos);
+            scroll_to(&id, new_pos).await;
         });
     });
     rsx! {
@@ -113,6 +132,7 @@ fn Infinite() -> Element {
             onscroll: move |_| async move {
                 let top = scroll_min(&id, 1.0).await;
                 if top <= 50.0 {
+                    scroll_height_before.set(scroll_height(&id).await);
                     for _ in 0..5 {
                         msgs.insert(0, new_message());
                     }
@@ -140,29 +160,26 @@ fn Infinite() -> Element {
             button {
                 class: "text-lg bg-gray-200 p-2",
                 onclick: move |_| async move {
-                    debug!("offset: {:?}", el.unwrap().get_scroll_offset().await);
+                    scroll_height_before.set(scroll_height(&id).await);
                     for _ in 0..5 {
                         msgs.insert(0, new_message());
                     }
-                    debug!("offset: {:?}", el.unwrap().get_scroll_offset().await);
                 },
                 "Insert Top"
            }
             button {
                 class: "text-lg bg-gray-200 p-2",
                 onclick: move |_| async move {
-                    debug!("offset: {:?}", el.unwrap().get_scroll_offset().await);
                     for _ in 0..5 {
                         msgs.push(new_message());
                     }
-                    debug!("offset: {:?}", el.unwrap().get_scroll_offset().await);
                 },
                 "Insert Bottom"
             }
             button {
                 class: "text-lg bg-gray-200 p-2",
                 onclick: move |_| async move {
-                    scroll_to(&id, 1).await;
+                    scroll_to(&id, 1.0).await;
                 },
                 "Scroll to top"
             }
