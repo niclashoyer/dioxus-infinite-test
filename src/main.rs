@@ -119,15 +119,17 @@ fn Infinite(scroll_margin: Option<f32>) -> Element {
         // }
         spawn(async move {
             let scroll_margin = scroll_margin.unwrap_or(50.0);
-            let pos = *pos.peek();
+            let current_pos = *pos.peek();
             let values = scroll_values(&id).await;
             let scroll_height_now = values.scroll_height;
             let mut new_pos = match height_before {
-                TopAdd(scroll_height_before) => pos + (values.scroll_height - scroll_height_before),
-                TopRemove(scroll_height_before) => {
-                    pos - (scroll_height_before - values.scroll_height)
+                TopAdd(scroll_height_before) => {
+                    current_pos + (values.scroll_height - scroll_height_before)
                 }
-                BottomAdd | BottomRemove => values.scroll_top,
+                TopRemove(scroll_height_before) => {
+                    current_pos - (scroll_height_before - values.scroll_height)
+                }
+                BottomAdd | BottomRemove => current_pos,
                 None => {
                     // scroll into the middle
                     // FIXME: this magic delay is needed on page load, otherwise the values are not correct,
@@ -152,7 +154,7 @@ fn Infinite(scroll_margin: Option<f32>) -> Element {
                 msgs.write().drain(0..5);
             }
 
-            debug!("pos: {}, values: {:?}", pos, values);
+            debug!("pos: {}, values: {:?}", current_pos, values);
             debug!("scroll height before: {:?}", height_before);
             debug!("scroll height now: {}", scroll_height_now);
             debug!("new_pos: {}", new_pos);
@@ -161,6 +163,8 @@ fn Infinite(scroll_margin: Option<f32>) -> Element {
             }
             if let TopRemove(_) | BottomRemove | None = height_before {
                 scroll_to(&id, new_pos).await;
+            } else {
+                pos.set(new_pos);
             }
         });
     });
