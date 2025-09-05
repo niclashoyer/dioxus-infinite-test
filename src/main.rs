@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use dioxus::{logger::tracing::debug, prelude::*};
-use itertools::Itertools;
 use lipsum::lipsum_words;
 use uuid::Uuid;
 
@@ -23,17 +22,10 @@ fn App() -> Element {
 }
 
 #[component]
-fn Message(text: String, scroll_to: Option<bool>) -> Element {
+fn Message(text: String) -> Element {
     rsx! {
         div {
             class: "text-lg bg-blue-300 p-4",
-            onmounted: move |e| async move {
-                if let Some(true) = scroll_to {
-                    let _ = e.data.scroll_to(ScrollBehavior::Instant).await;
-                    dioxus_time::sleep(Duration::from_millis(100)).await;
-                    let _ = e.data.scroll_to(ScrollBehavior::Instant).await;
-                }
-            },
             p {
                 "{text}"
             }
@@ -72,54 +64,104 @@ async fn scroll_to(id: &Uuid, pos: f32) {
     .await;
 }
 
-async fn scroll_min(id: &Uuid, min: f32) -> f32 {
-    let mut eval = dioxus::document::eval(&format!(
-        r#"
-        let el = document.getElementById("{id}");
-        let min = {min};
-        if (el.scrollTop <= min) {{
-            el.scrollTop = min;
-            console.log(min, el.scrollTop);
-        }}
-        dioxus.send(el.scrollTop);
-    "#
-    ));
-    eval.recv().await.unwrap()
+#[derive(Debug, Clone, Copy)]
+struct ElementValues {
+    scroll_top: f32,
+    scroll_height: f32,
+    offset_height: f32,
 }
 
-async fn scroll_height(id: &Uuid) -> f32 {
+async fn scroll_values(id: &Uuid) -> ElementValues {
     let mut eval = dioxus::document::eval(&format!(
         r#"
         let el = document.getElementById("{id}");
+        dioxus.send(el.scrollTop);
         dioxus.send(el.scrollHeight);
+        dioxus.send(el.offsetHeight);
     "#
     ));
-    eval.recv().await.unwrap()
+    let scroll_top = eval.recv().await.unwrap();
+    let scroll_height = eval.recv().await.unwrap();
+    let offset_height = eval.recv().await.unwrap();
+    ElementValues {
+        scroll_top,
+        scroll_height,
+        offset_height,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScrollHeightBeforeMutation {
+    None,
+    TopAdd(f32),
+    BottomAdd,
+    TopRemove(f32),
+    BottomRemove,
 }
 
 #[component]
-fn Infinite() -> Element {
+fn Infinite(scroll_margin: Option<f32>) -> Element {
     let mut el = use_signal(|| None);
     let mut pos = use_signal(|| 0.0);
-    let mut scroll_height_before = use_signal(|| 0.0);
+    let mut scroll_height_before = use_signal(|| ScrollHeightBeforeMutation::None);
     let mut msgs: Signal<Vec<(Uuid, String)>> = use_signal(|| vec![]);
     let id = use_hook(|| Uuid::new_v4());
     use_hook(move || {
-        for _ in 0..5 {
+        for _ in 0..15 {
             msgs.push(new_message());
         }
     });
     use_effect(move || {
-        let scroll_height_before = scroll_height_before();
+        use ScrollHeightBeforeMutation::*;
+        let height_before = scroll_height_before();
+        // if let ScrollHeightBeforeMutation::None = scroll_height_before {
+        //     return;
+        // }
         spawn(async move {
+            let scroll_margin = scroll_margin.unwrap_or(50.0);
             let pos = *pos.peek();
-            let scroll_height_now = scroll_height(&id).await;
-            let new_pos = pos + (scroll_height_now - scroll_height_before);
-            debug!("pos: {}", pos);
-            debug!("scroll height before: {}", scroll_height_before);
+            let values = scroll_values(&id).await;
+            let scroll_height_now = values.scroll_height;
+            let mut new_pos = match height_before {
+                TopAdd(scroll_height_before) => pos + (values.scroll_height - scroll_height_before),
+                TopRemove(scroll_height_before) => {
+                    pos - (scroll_height_before - values.scroll_height)
+                }
+                BottomAdd | BottomRemove => values.scroll_top,
+                None => {
+                    // scroll into the middle
+                    // FIXME: this magic delay is needed on page load, otherwise the values are not correct,
+                    // as the css is still not fully loaded
+                    dioxus_time::sleep(Duration::from_millis(100)).await;
+                    let values = scroll_values(&id).await;
+                    (values.scroll_height - values.offset_height) / 2.0
+                }
+            };
+
+            // if we added elements at top or bottom in the last run,
+            // remove the elements on the opposite side
+            // FIXME: extract this into some kind of callback
+            if let TopAdd(_) = height_before {
+                scroll_height_before.set(ScrollHeightBeforeMutation::BottomRemove);
+                let mut msgs = msgs.write();
+                let len = msgs.len().saturating_sub(5);
+                msgs.drain(len..);
+            } else if let BottomAdd = height_before {
+                scroll_height_before
+                    .set(ScrollHeightBeforeMutation::TopRemove(values.scroll_height));
+                msgs.write().drain(0..5);
+            }
+
+            debug!("pos: {}, values: {:?}", pos, values);
+            debug!("scroll height before: {:?}", height_before);
             debug!("scroll height now: {}", scroll_height_now);
             debug!("new_pos: {}", new_pos);
-            scroll_to(&id, new_pos).await;
+            if (new_pos <= scroll_margin) {
+                new_pos = scroll_margin + 1.0;
+            }
+            if let TopRemove(_) | BottomRemove | None = height_before {
+                scroll_to(&id, new_pos).await;
+            }
         });
     });
     rsx! {
@@ -127,17 +169,25 @@ fn Infinite() -> Element {
             id: "{id}",
             onmounted: move |e| async move {
                 el.set(Some(e.data));
-                // scroll_to(&id, 42).await;
             },
             onscroll: move |_| async move {
-                let top = scroll_min(&id, 1.0).await;
-                if top <= 50.0 {
-                    scroll_height_before.set(scroll_height(&id).await);
+                use ScrollHeightBeforeMutation::*;
+                let scroll_margin = scroll_margin.unwrap_or(50.0);
+                let values = scroll_values(&id).await;
+                if values.scroll_top <= scroll_margin {
+                    // insert top
+                    scroll_height_before.set(TopAdd(values.scroll_height));
                     for _ in 0..5 {
                         msgs.insert(0, new_message());
                     }
+                } else if values.scroll_top >= values.scroll_height - values.offset_height - scroll_margin {
+                    // insert bottom
+                    scroll_height_before.set(BottomAdd);
+                    for _ in 0..5 {
+                        msgs.push(new_message());
+                    }
                 }
-                pos.set(top);
+                pos.set(values.scroll_top);
             },
             class: "max-w-128 max-h-128 bg-gray-100 overflow-y-scroll",
             div {
@@ -146,21 +196,20 @@ fn Infinite() -> Element {
             }
             div {
                 class: "flex flex-col gap-4 p-4",
-                for (pos, (id, msg)) in msgs().iter().with_position() {
+                for (id, msg) in msgs() {
                     Message {
                         key: "{id}",
                         text: msg,
-                        scroll_to: pos == itertools::Position::Last
                     }
                 }
             }
         }
         div {
-            class: "py-4 flex gap-4",
+            class: "p-4 flex gap-4",
             button {
                 class: "text-lg bg-gray-200 p-2",
                 onclick: move |_| async move {
-                    scroll_height_before.set(scroll_height(&id).await);
+                    scroll_height_before.set(ScrollHeightBeforeMutation::TopAdd(scroll_values(&id).await.scroll_height));
                     for _ in 0..5 {
                         msgs.insert(0, new_message());
                     }
@@ -170,6 +219,7 @@ fn Infinite() -> Element {
             button {
                 class: "text-lg bg-gray-200 p-2",
                 onclick: move |_| async move {
+                    scroll_height_before.set(ScrollHeightBeforeMutation::BottomAdd);
                     for _ in 0..5 {
                         msgs.push(new_message());
                     }
